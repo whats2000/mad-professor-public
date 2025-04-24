@@ -2,11 +2,14 @@ import json
 import queue
 import pyaudio
 import requests
+import wave
+import io
+from concurrent.futures import ThreadPoolExecutor
 from PyQt6.QtCore import QThread, QObject, pyqtSignal, QMutex, QTimer
-from config import TTS_GROUP_ID, TTS_API_KEY
+from config import TTS_API_URL, TTS_REF_AUDIO_PATH, TTS_PROMPT_TEXT, TTS_PROMPT_LANG
 
-url = "https://api.minimax.chat/v1/t2a_v2?GroupId=" + TTS_GROUP_ID
-headers = {"Content-Type": "application/json", "Authorization": "Bearer " + TTS_API_KEY}
+# Update the URL to the open-source TTS API endpoint
+url = TTS_API_URL if hasattr(globals(), 'TTS_API_URL') else "http://127.0.0.1:9880/tts"
 
 class TTSThread(QThread):
     """TTS播放线程，负责播放音频数据"""
@@ -139,7 +142,7 @@ class TTSManager(QObject):
         # 音频配置 - 与API请求中的配置保持一致
         self.audio_config = {
             'channels': 1,
-            'rate': 32000,  # 与API的sample_rate一致
+            'rate': 32000,  # 32kHz sample rate
             'format': pyaudio.paInt16  # 16位PCM
         }
         
@@ -150,15 +153,21 @@ class TTSManager(QObject):
         # 连接实际播放开始信号
         self.player_thread.audio_playback_started.connect(self._on_audio_playback_started)
         
+        # 创建线程池用于并发TTS请求
+        self.thread_pool = ThreadPoolExecutor(max_workers=3)
+        
         # 当前请求是否正在进行
         self.is_requesting = False
+        self.is_processing = False  # 添加此属性来跟踪处理状态
         
         # 修改请求队列结构，包含文本和请求ID
         self.request_queue = []  # [(text, request_id, emotion), ...]
-        self.is_processing = False
+        self.active_requests = set()  # 跟踪活动的请求ID
         
-        # 当前正在处理的请求ID
-        self.current_processing_id = None
+        # 设置默认参考音频和提示文本
+        self.ref_audio_path = TTS_REF_AUDIO_PATH if hasattr(globals(), 'TTS_REF_AUDIO_PATH') else "/home/hsiaofe/Desktop/Voice Sample/雷电将军.wav"
+        self.prompt_text = TTS_PROMPT_TEXT if hasattr(globals(), 'TTS_PROMPT_TEXT') else "哎呀，你不会怕了吧。明明此世最为殊胜最为恐怖的雷霆化身就站在你身边。"
+        self.prompt_lang = TTS_PROMPT_LANG if hasattr(globals(), 'TTS_PROMPT_LANG') else "zh"
 
     def is_queue_empty(self) -> bool:
         """
@@ -169,50 +178,42 @@ class TTSManager(QObject):
         """
         return self.player_thread.is_queue_empty() and len(self.request_queue) == 0
 
-    def build_tts_stream_headers(self) -> dict:
-        """构建请求头"""
-        headers = {
-            'accept': 'application/json, text/plain, */*',
-            'content-type': 'application/json',
-            'authorization': "Bearer " + TTS_API_KEY,
-        }
-        return headers
-
-    def build_tts_stream_body(self, text: str, emotion: str = "neutral") -> dict:
-        """构建请求体"""
-        # 映射简化的情绪到minimax支持的情绪
-        emotion_mapping = {
-            "happy": "happy",
-            "sad": "sad",
-            "angry": "angry",
-            "fearful": "fearful",
-            "disgusted": "disgusted",
-            "surprised": "surprised",
-            "neutral": "neutral"
-        }
+    def build_tts_params(self, text: str, emotion: str = "neutral") -> dict:
+        """
+        构建请求参数
         
-        # 获取映射后的情绪，如果没有则使用neutral作为默认值
-        mapped_emotion = emotion_mapping.get(emotion, "neutral")
-        
-        body = json.dumps({
-            "model": "speech-02-turbo",
+        Args:
+            text: 要转换的文本
+            emotion: 情绪类型，用于选择合适的参数配置
+            
+        Returns:
+            dict: 请求参数字典
+        """
+        # 根据情绪可以调整一些参数如temperature, repetition_penalty等
+        # 这里简单映射，实际使用时可以进一步调整
+        params = {
             "text": text,
-            "stream": True,
-            "voice_setting": {
-                "voice_id": "leidianjiangjun",
-                "speed": 1,
-                "vol": 1,
-                "pitch": 0,
-                "emotion": mapped_emotion
-            },
-            "audio_setting": {
-                "sample_rate": 32000,
-                "bitrate": 128000,
-                "format": "pcm",
-                "channel": 1
-            }
-        })
-        return body
+            "text_lang": "zh",  # 默认使用中文，可以从配置中读取
+            "ref_audio_path": self.ref_audio_path,
+            "prompt_text": self.prompt_text,
+            "prompt_lang": self.prompt_lang,
+            "text_split_method": "cut5",
+            "batch_size": 1,
+            "streaming_mode": True
+        }
+        
+        # 根据情绪调整参数
+        if emotion == "happy":
+            params["speed_factor"] = 1.1  # 快一点
+            params["temperature"] = 1.1  # 增加随机性
+        elif emotion == "sad":
+            params["speed_factor"] = 0.9  # 慢一点
+            params["temperature"] = 0.9  # 降低随机性
+        elif emotion == "angry":
+            params["speed_factor"] = 1.2  # 更快
+            params["temperature"] = 1.2  # 更高随机性
+        
+        return params
 
     def request_tts(self, text: str, request_id: str = None, emotion: str = "neutral"):
         """
@@ -249,13 +250,9 @@ class TTSManager(QObject):
         """处理队列中的下一个TTS请求"""
         if not self.request_queue:
             self.is_processing = False
-            self.current_processing_id = None
             return
             
-        # 设置处理标志
-        self.is_processing = True
-        
-        # 解包请求数据
+        # 获取下一个请求
         if len(self.request_queue[0]) == 3:
             text, request_id, emotion = self.request_queue.pop(0)
         else:
@@ -263,54 +260,57 @@ class TTSManager(QObject):
             text, request_id = self.request_queue.pop(0)
             emotion = "neutral"
         
-        self.current_processing_id = request_id
-        
         print(f"开始处理TTS请求: '{text[:20]}...' (请求ID: {request_id}, 情绪: {emotion})")
         
-        # 处理TTS请求
-        tts_headers = self.build_tts_stream_headers()
-        tts_body = self.build_tts_stream_body(text, emotion)  # 传递情绪参数
+        # 将请求ID添加到活动请求集合
+        self.active_requests.add(request_id)
         
-        try:
-            response = requests.request("POST", url, stream=True, headers=tts_headers, data=tts_body)
-            
-            # 即时处理所有音频块
-            audio_chunks = []
-            for chunk in response.raw:
-                if chunk and chunk[:5] == b'data:':
-                    data = json.loads(chunk[5:])
-                    if "data" in data and "extra_info" not in data:
-                        if "audio" in data["data"]:
-                            audio_hex = data["data"]['audio']
-                            if audio_hex and audio_hex != '\n':
-                                audio_data = bytes.fromhex(audio_hex)
-                                audio_chunks.append(audio_data)
-            
-            # 合并所有音频数据
-            full_chunk = b"".join(audio_chunks)
-            
-            # 添加带元数据的音频到播放队列
-            self.player_thread.add_audio(full_chunk, (text, request_id))
-            
-            # 发送队列添加信号（保持原有行为，可以在UI中用于显示进度或状态）
-            self.tts_playback_started.emit(text, request_id)
-            
-            # 处理下一个请求
+        # 构建参数
+        params = self.build_tts_params(text, emotion)
+        
+        # 提交到线程池执行
+        self.thread_pool.submit(self._execute_tts_request, text, request_id, emotion, params)
+        
+        # 立即处理下一个请求，不等待当前请求完成
+        if self.request_queue:
             QTimer.singleShot(100, self._process_next_request)
-                                    
+
+    def _execute_tts_request(self, text, request_id, emotion, params):
+        """在线程池中执行TTS请求"""
+        try:
+            # 发送GET请求到TTS API
+            response = requests.get(url, params=params, stream=True)
+            
+            if response.status_code != 200:
+                print(f"[TTS请求错误] 状态码: {response.status_code}, 消息: {response.text}")
+                raise Exception(f"API返回错误: {response.status_code}")
+            
+            # 处理音频流响应
+            audio_data = response.content
+            
+            # 如果请求已被取消，则不添加到播放队列
+            if request_id not in self.active_requests:
+                print(f"请求 {request_id} 已被取消，不添加到播放队列")
+                return
+                
+            # 将PCM数据添加到播放队列
+            self.player_thread.add_audio(audio_data, (text, request_id))
+            
+            # 发送队列添加信号
+            self.tts_playback_started.emit(text, request_id)
+                                
         except Exception as e:
             print(f"[TTS请求错误] {str(e)}")
-            self.is_processing = False
-            self.current_processing_id = None
-            
-            # 出错时也继续处理队列
-            QTimer.singleShot(500, self._process_next_request)
+        finally:
+            # 请求完成后从活动集合中移除
+            if request_id in self.active_requests:
+                self.active_requests.remove(request_id)
 
     def stop_playing(self):
         """停止当前播放并清空队列"""
         self.request_queue = []
         self.is_processing = False
-        self.current_processing_id = None
+        self.active_requests.clear()  # 清空活动请求集合
         self.player_thread.clear_queue()
         print("已停止所有TTS播放和请求")
 
@@ -323,16 +323,15 @@ class TTSManager(QObject):
         # 过滤掉队列中指定请求ID的项目
         self.request_queue = [(text, rid, emotion) for text, rid, emotion in self.request_queue if rid != request_id]
         
-        # 如果当前正在处理的请求是要取消的请求，则停止处理
-        if self.current_processing_id == request_id:
-            self.is_processing = False
-            self.current_processing_id = None
+        # 从活动请求集合中移除
+        if request_id in self.active_requests:
+            self.active_requests.remove(request_id)
         
-        # 清理播放队列中的过时音频 - 增加这一行
+        # 清理播放队列中的过时音频
         self.player_thread.cancel_request_id(request_id)
         
-        # 如果还有其他请求，则开始处理
-        if not self.is_processing and self.request_queue:
+        # 如果还有其他请求，确保处理继续
+        if self.request_queue and not any(rid in self.active_requests for _, rid, _ in self.request_queue):
             QTimer.singleShot(100, self._process_next_request)
 
     def stop(self):
@@ -342,3 +341,78 @@ class TTSManager(QObject):
     def get_audio(self) -> bytes:
         """获取收集的完整音频数据"""
         return self.player_thread.full_audio
+
+# 测试函数，用于验证TTS功能
+def test_tts_api():
+    """测试TTS API功能"""
+    import time
+    
+    print("\n====== 开始测试TTS功能 ======")
+    print(f"TTS API URL: {url}")
+    print(f"参考音频路径: {TTS_REF_AUDIO_PATH}")
+    print(f"提示文本: {TTS_PROMPT_TEXT}")
+    
+    # 创建TTS管理器实例
+    tts_manager = TTSManager()
+    
+    # 定义测试文本
+    test_texts = [
+        ("这是一个测试句子，用于验证TTS功能是否正常工作。", "正常"),
+        ("我非常高兴能够为您服务！", "高兴"),
+        ("我感到有些失落和悲伤...", "悲伤"),
+        ("这太令人气愤了！我无法接受这种情况！", "愤怒")
+    ]
+    
+    # 连接信号处理函数
+    def on_tts_playback_started(text, request_id):
+        print(f"\n[事件] TTS开始播放: '{text[:30]}...' (ID: {request_id})")
+    
+    def on_audio_playback_started(text, request_id):
+        print(f"[事件] 音频实际开始播放: '{text[:30]}...' (ID: {request_id})")
+    
+    tts_manager.tts_playback_started.connect(on_tts_playback_started)
+    tts_manager.tts_audio_playback_started.connect(on_audio_playback_started)
+    
+    # 测试不同情绪的TTS
+    for i, (text, emotion) in enumerate(test_texts):
+        request_id = f"test_{i+1}"
+        print(f"\n[测试 {i+1}] 请求TTS: '{text}' (情绪: {emotion})")
+        
+        # 映射情绪到参数
+        emotion_param = "neutral"
+        if (emotion == "高兴"):
+            emotion_param = "happy"
+        elif (emotion == "悲伤"):
+            emotion_param = "sad"
+        elif (emotion == "愤怒"):
+            emotion_param = "angry"
+            
+        # 请求TTS
+        tts_manager.request_tts(text, request_id, emotion_param)
+        
+        # 等待5秒让音频播放
+        print(f"[等待] 播放音频中...")
+        time.sleep(5)
+    
+    # 等待所有音频播放完毕
+    print("\n[等待] 等待所有音频播放完毕...")
+    while not tts_manager.is_queue_empty():
+        time.sleep(0.5)
+    
+    # 测试取消功能
+    cancel_text = "这是一个将被取消的语音请求，它不应该被播放出来。"
+    cancel_id = "cancel_test"
+    print(f"\n[测试取消] 请求TTS并立即取消: '{cancel_text}'")
+    tts_manager.request_tts(cancel_text, cancel_id)
+    time.sleep(0.1)  # 稍微等待一下，确保请求被添加到队列
+    tts_manager.cancel_request_id(cancel_id)
+    print("[测试取消] 已取消请求")
+    
+    # 测试结束，停止TTS线程
+    time.sleep(1)
+    tts_manager.stop()
+    print("\n====== TTS功能测试完成 ======")
+
+# 如果直接运行此文件，则执行测试
+if __name__ == "__main__":
+    test_tts_api()

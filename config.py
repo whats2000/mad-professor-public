@@ -5,11 +5,20 @@ from openai import OpenAI
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # API配置
-API_BASE_URL = "YOUR_API_URL"
-API_KEY = "YOUR_API_KEY"
+API_BASE_URL = "http://localhost:11434/v1"
+API_KEY = "ollama"
 
+# 旧的Minimax TTS配置（保留以兼容旧代码）
 TTS_GROUP_ID = "YOUR_MINIMAX_GROUP_ID"
 TTS_API_KEY = "YOUR_MINIMAX_API_KEY"
+MODEL_ID = "qwen2.5:14b"
+MAX_TOKENS = 128000
+
+# 新的开源TTS API配置
+TTS_API_URL = "http://127.0.0.1:9880/tts"  # GPT-SoVITS API地址
+TTS_REF_AUDIO_PATH = "/home/hsiaofe/Desktop/Voice Sample/雷电将军.wav"  # 参考音频路径
+TTS_PROMPT_TEXT = "哎呀，你不会怕了吧。明明此世最为殊胜最为恐怖的雷霆化身就站在你身边。"  # 提示文本
+TTS_PROMPT_LANG = "zh"  # 提示文本语言
 
 # 嵌入模型配置
 EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
@@ -56,7 +65,7 @@ class LLMClient:
         
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
         )
         self._initialized = True
         
@@ -73,10 +82,11 @@ class LLMClient:
         """
         try:
             response = self.client.chat.completions.create(
-                model="deepseek-v3-250324",
+                model=MODEL_ID,
                 messages=messages,
                 temperature=temperature,
-                stream=stream
+                stream=stream,
+                max_tokens=MAX_TOKENS,
             )
             
             if stream:
@@ -110,10 +120,11 @@ class LLMClient:
         """
         try:
             response = self.client.chat.completions.create(
-                model="deepseek-v3-250324",
+                model=MODEL_ID,
                 messages=messages,
                 temperature=temperature,
-                stream=True
+                stream=True,
+                max_tokens=MAX_TOKENS,
             )
             
             full_response = ""
